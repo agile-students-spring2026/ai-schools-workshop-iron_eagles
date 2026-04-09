@@ -39,6 +39,7 @@ export interface District {
   lowest_grade_offered: number;
   highest_grade_offered: number;
   county_name: string;
+  phone?: string;
 }
 
 export interface DistrictFinance {
@@ -107,22 +108,62 @@ export const STATES: Record<string, { name: string; fips: number }> = {
   WY: { name: 'Wyoming', fips: 56 },
 };
 
+// District data is bundled as static JSON per state (from NCES CCD 2022-23)
 export async function fetchDistricts(fips: number): Promise<District[]> {
-  const url = `${BASE_URL}/school-districts/ccd/directory/${YEAR}/?fips=${fips}`;
+  const url = `${import.meta.env.BASE_URL}data/districts/${fips}.json`;
   const res = await fetch(url);
-  const data = await res.json();
-  // Filter to only regular school districts (agency_type 1) with enrollment > 0
-  // agency_type 1 = regular districts, 2 = component districts (e.g. NYC Geographic Districts)
-  return data.results.filter((d: District) => 
-    (d.agency_type === 1 || d.agency_type === 2) && d.enrollment && d.enrollment > 0
-  );
+  if (!res.ok) throw new Error(`Failed to load district data for FIPS ${fips}`);
+  const data: District[] = await res.json();
+  return data;
+}
+
+// Schools are bundled as static JSON per state (from NCES CCD 2022-23)
+// The JSON is keyed by leaid, so we need to know the state fips
+let schoolsCache: Record<number, Record<string, School[]>> = {};
+
+// Reset cache (for testing)
+export function resetSchoolsCache() {
+  schoolsCache = {};
 }
 
 export async function fetchSchoolsInDistrict(leaid: string): Promise<School[]> {
-  const url = `${BASE_URL}/schools/ccd/directory/${YEAR}/?leaid=${leaid}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  return data.results.filter((s: School) => s.enrollment && s.enrollment > 0);
+  // Extract fips from leaid (first 2 digits)
+  const fips = parseInt(leaid.substring(0, 2), 10);
+  
+  // Load schools for this state if not cached
+  if (!schoolsCache[fips]) {
+    const url = `${import.meta.env.BASE_URL}data/schools/${fips}.json`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Failed to load school data for FIPS ${fips}`);
+    schoolsCache[fips] = await res.json();
+  }
+  
+  const schools = schoolsCache[fips][leaid] || [];
+  
+  // Map to expected School interface
+  return schools
+    .filter((s: any) => s.enrollment && s.enrollment > 0)
+    .map((s: any) => ({
+      ncessch: s.ncessch,
+      school_name: s.school_name,
+      lea_name: '', // Not in bundled data
+      city_location: s.city,
+      state_location: s.state,
+      zip_location: s.zip,
+      latitude: s.lat,
+      longitude: s.lon,
+      school_level: 0, // TODO: map level string
+      school_type: s.charter ? 1 : 0,
+      charter: s.charter ? 1 : 0,
+      magnet: null,
+      enrollment: s.enrollment,
+      teachers_fte: s.teachers_fte,
+      free_lunch: null,
+      reduced_price_lunch: null,
+      free_or_reduced_price_lunch: null,
+      lowest_grade_offered: 0,
+      highest_grade_offered: 12,
+    }));
 }
 
 export async function fetchDistrictFinance(leaid: string): Promise<DistrictFinance | null> {
@@ -227,4 +268,141 @@ export async function fetchDemographics(leaid: string): Promise<DemographicBreak
       color: RACE_COLORS[r.race] || '#94a3b8',
     }))
     .sort((a, b) => b.enrollment - a.enrollment);
+}
+
+// Niche integration - generates a Niche URL for a district
+export function getNicheDistrictUrl(districtName: string, stateAbbr: string): string {
+  const slug = districtName
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  const state = stateAbbr.toLowerCase();
+  return `https://www.niche.com/k12/d/${slug}-${state}/`;
+}
+
+// Niche URL for a school
+export function getNicheSchoolUrl(schoolName: string, city: string, stateAbbr: string): string {
+  const slug = `${schoolName} ${city} ${stateAbbr}`
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  return `https://www.niche.com/k12/${slug}/`;
+}
+
+// ---------------------------------------------------------------------------
+// Niche companion server integration
+// ---------------------------------------------------------------------------
+
+const NICHE_SERVER = 'http://localhost:8080';
+
+export interface NicheGrades {
+  overall_grade: string | null;
+  grades: Record<string, string>;
+}
+
+export interface NicheReviews {
+  average: number;
+  count: number;
+}
+
+export interface NicheRanking {
+  display: string;
+  ordinal?: number;
+  total?: number;
+}
+
+export interface NicheDistrictData {
+  overall_grade: string | null;
+  grades: Record<string, string>;
+  enrollment?: number;
+  student_teacher_ratio?: number;
+  graduation_rate?: number;
+  math_proficiency?: number;
+  reading_proficiency?: number;
+  reviews?: NicheReviews;
+  rankings?: NicheRanking[];
+  schools?: NicheSchoolSummary[];
+  niche_url: string;
+  nces_id?: string;
+}
+
+export interface NicheSchoolSummary {
+  name: string;
+  ncessch?: string;
+  overall_grade?: string;
+  enrollment?: number;
+  student_teacher_ratio?: number;
+  reviews?: NicheReviews;
+}
+
+export interface NicheSchoolData {
+  overall_grade: string | null;
+  grades: Record<string, string>;
+  enrollment?: number;
+  student_teacher_ratio?: number;
+  graduation_rate?: number;
+  reviews?: NicheReviews;
+  rankings?: NicheRanking[];
+  niche_url: string;
+  nces_id?: string;
+}
+
+let nicheServerAvailable: boolean | null = null;
+
+async function checkNicheServer(): Promise<boolean> {
+  if (nicheServerAvailable !== null) return nicheServerAvailable;
+  try {
+    const res = await fetch(`${NICHE_SERVER}/health`, { signal: AbortSignal.timeout(2000) });
+    nicheServerAvailable = res.ok;
+  } catch {
+    nicheServerAvailable = false;
+  }
+  return nicheServerAvailable;
+}
+
+export async function fetchNicheDistrict(
+  name: string,
+  state: string,
+  leaid?: string
+): Promise<NicheDistrictData | null> {
+  if (!(await checkNicheServer())) return null;
+  
+  const params = new URLSearchParams({ name, state });
+  if (leaid) params.set('leaid', leaid);
+  
+  try {
+    const res = await fetch(`${NICHE_SERVER}/niche/district?${params}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchNicheSchool(
+  name: string,
+  city: string,
+  state: string,
+  ncessch?: string
+): Promise<NicheSchoolData | null> {
+  if (!(await checkNicheServer())) return null;
+  
+  const params = new URLSearchParams({ name, city, state });
+  if (ncessch) params.set('ncessch', ncessch);
+  
+  try {
+    const res = await fetch(`${NICHE_SERVER}/niche/school?${params}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
 }
